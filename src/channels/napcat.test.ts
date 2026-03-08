@@ -1,4 +1,7 @@
 import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
+import os from 'os';
+import path from 'path';
+import fs from 'fs';
 
 // --- Mocks ---
 
@@ -12,6 +15,7 @@ vi.mock('../env.js', () => ({ readEnvFile: vi.fn(() => ({})) }));
 vi.mock('../config.js', () => ({
   ASSISTANT_NAME: 'Andy',
   TRIGGER_PATTERN: /^@Andy\b/i,
+  GROUPS_DIR: '/tmp/napcat-test-groups',
 }));
 
 // Mock logger
@@ -317,6 +321,21 @@ describe('NapCatChannel', () => {
     it('handles unknown segment types without text data', () => {
       const segments = [{ type: 'custom', data: { foo: 'bar' } }];
       expect(extractTextContent(segments, 'raw')).toBe('raw');
+    });
+
+    it('handles file segments with name', () => {
+      const segments = [{ type: 'file', data: { name: 'report.docx', file: 'abc123' } }];
+      expect(extractTextContent(segments, '')).toBe('[File: report.docx]');
+    });
+
+    it('handles file segments with file fallback', () => {
+      const segments = [{ type: 'file', data: { file: 'abc123.pdf' } }];
+      expect(extractTextContent(segments, '')).toBe('[File: abc123.pdf]');
+    });
+
+    it('handles file segments with no name', () => {
+      const segments = [{ type: 'file', data: {} }];
+      expect(extractTextContent(segments, '')).toBe('[File: ]');
     });
   });
 
@@ -847,6 +866,378 @@ describe('NapCatChannel', () => {
         createTestOpts(),
       );
       expect(channel.name).toBe('napcat');
+    });
+  });
+
+  // --- File receive (download) ---
+
+  describe('file receive', () => {
+    let tmpDir: string;
+
+    beforeEach(() => {
+      tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'napcat-test-'));
+    });
+
+    afterEach(() => {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    });
+
+    it('downloads image and includes container path in content', async () => {
+      const opts = createTestOpts();
+      const channel = new NapCatChannel('ws://localhost:6700', '', opts, tmpDir);
+      await connectChannel(channel);
+
+      // Mock fetch to return a fake image
+      const mockFetch = vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        body: new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode('fake-image-data'));
+            controller.close();
+          },
+        }),
+      });
+      vi.stubGlobal('fetch', mockFetch);
+
+      const message = [
+        { type: 'image', data: { url: 'http://example.com/photo.jpg', file: 'photo.jpg' } },
+        { type: 'text', data: { text: ' caption' } },
+      ];
+      currentWs().emit(
+        'message',
+        createGroupMessageEvent({ message, rawMessage: '[Image] caption' }),
+      );
+
+      // Wait for async handleMessage to complete
+      await vi.waitFor(() => {
+        expect(opts.onMessage).toHaveBeenCalled();
+      });
+
+      const call = (opts.onMessage as any).mock.calls[0];
+      const content = call[1].content;
+      expect(content).toMatch(/\[Image: \/workspace\/group\/files\/\d+_photo\.jpg\]/);
+      expect(content).toContain('caption');
+
+      // Verify file was actually written
+      const filesDir = path.join(tmpDir, 'test-group', 'files');
+      const files = fs.readdirSync(filesDir);
+      expect(files.length).toBe(1);
+      expect(files[0]).toMatch(/^\d+_photo\.jpg$/);
+
+      vi.unstubAllGlobals();
+    });
+
+    it('downloads file segment and includes container path', async () => {
+      const opts = createTestOpts();
+      const channel = new NapCatChannel('ws://localhost:6700', '', opts, tmpDir);
+      await connectChannel(channel);
+
+      const mockFetch = vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        body: new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode('fake-doc-data'));
+            controller.close();
+          },
+        }),
+      });
+      vi.stubGlobal('fetch', mockFetch);
+
+      const message = [
+        { type: 'file', data: { url: 'http://example.com/report.docx', name: 'report.docx' } },
+      ];
+      currentWs().emit(
+        'message',
+        createGroupMessageEvent({ message, rawMessage: '[File]' }),
+      );
+
+      await vi.waitFor(() => {
+        expect(opts.onMessage).toHaveBeenCalled();
+      });
+
+      const call = (opts.onMessage as any).mock.calls[0];
+      const content = call[1].content;
+      expect(content).toMatch(/\[File: \/workspace\/group\/files\/\d+_report\.docx\]/);
+
+      vi.unstubAllGlobals();
+    });
+
+    it('falls back to placeholder when download fails', async () => {
+      const opts = createTestOpts();
+      const channel = new NapCatChannel('ws://localhost:6700', '', opts, tmpDir);
+      await connectChannel(channel);
+
+      // Mock fetch to fail
+      const mockFetch = vi.fn().mockResolvedValue({
+        ok: false,
+        status: 404,
+        body: null,
+      });
+      vi.stubGlobal('fetch', mockFetch);
+
+      const message = [
+        { type: 'image', data: { url: 'http://example.com/missing.jpg', file: 'missing.jpg' } },
+      ];
+      currentWs().emit(
+        'message',
+        createGroupMessageEvent({ message, rawMessage: '[Image]' }),
+      );
+
+      await vi.waitFor(() => {
+        expect(opts.onMessage).toHaveBeenCalled();
+      });
+
+      const call = (opts.onMessage as any).mock.calls[0];
+      expect(call[1].content).toBe('[Image]');
+
+      vi.unstubAllGlobals();
+    });
+
+    it('falls back to placeholder when no URL available', async () => {
+      const opts = createTestOpts();
+      const channel = new NapCatChannel('ws://localhost:6700', '', opts, tmpDir);
+      await connectChannel(channel);
+
+      // Image segment with no url and no file_id — resolveFileUrl returns null
+      const message = [
+        { type: 'image', data: {} },
+      ];
+      currentWs().emit(
+        'message',
+        createGroupMessageEvent({ message, rawMessage: '[Image]' }),
+      );
+
+      await vi.waitFor(() => {
+        expect(opts.onMessage).toHaveBeenCalled();
+      });
+
+      const call = (opts.onMessage as any).mock.calls[0];
+      expect(call[1].content).toBe('[Image]');
+    });
+
+    it('does not attempt download for unregistered groups', async () => {
+      const opts = createTestOpts();
+      const channel = new NapCatChannel('ws://localhost:6700', '', opts, tmpDir);
+      await connectChannel(channel);
+
+      const mockFetch = vi.fn();
+      vi.stubGlobal('fetch', mockFetch);
+
+      const message = [
+        { type: 'image', data: { url: 'http://example.com/photo.jpg', file: 'photo.jpg' } },
+      ];
+      currentWs().emit(
+        'message',
+        createGroupMessageEvent({ groupId: 999999, message, rawMessage: '[Image]' }),
+      );
+
+      // Should not call fetch for unregistered group
+      expect(mockFetch).not.toHaveBeenCalled();
+      // Should not deliver message
+      expect(opts.onMessage).not.toHaveBeenCalled();
+
+      vi.unstubAllGlobals();
+    });
+
+    it('handles voice segment download', async () => {
+      const opts = createTestOpts();
+      const channel = new NapCatChannel('ws://localhost:6700', '', opts, tmpDir);
+      await connectChannel(channel);
+
+      const mockFetch = vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        body: new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode('fake-audio'));
+            controller.close();
+          },
+        }),
+      });
+      vi.stubGlobal('fetch', mockFetch);
+
+      const message = [
+        { type: 'record', data: { url: 'http://example.com/voice.amr', file: 'voice.amr' } },
+      ];
+      currentWs().emit(
+        'message',
+        createGroupMessageEvent({ message, rawMessage: '[Voice]' }),
+      );
+
+      await vi.waitFor(() => {
+        expect(opts.onMessage).toHaveBeenCalled();
+      });
+
+      const call = (opts.onMessage as any).mock.calls[0];
+      expect(call[1].content).toMatch(/\[Voice: \/workspace\/group\/files\/\d+_voice\.amr\]/);
+
+      vi.unstubAllGlobals();
+    });
+
+    it('handles video segment download', async () => {
+      const opts = createTestOpts();
+      const channel = new NapCatChannel('ws://localhost:6700', '', opts, tmpDir);
+      await connectChannel(channel);
+
+      const mockFetch = vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        body: new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode('fake-video'));
+            controller.close();
+          },
+        }),
+      });
+      vi.stubGlobal('fetch', mockFetch);
+
+      const message = [
+        { type: 'video', data: { url: 'http://example.com/clip.mp4', file: 'clip.mp4' } },
+      ];
+      currentWs().emit(
+        'message',
+        createGroupMessageEvent({ message, rawMessage: '[Video]' }),
+      );
+
+      await vi.waitFor(() => {
+        expect(opts.onMessage).toHaveBeenCalled();
+      });
+
+      const call = (opts.onMessage as any).mock.calls[0];
+      expect(call[1].content).toMatch(/\[Video: \/workspace\/group\/files\/\d+_clip\.mp4\]/);
+
+      vi.unstubAllGlobals();
+    });
+
+    it('text-only messages still work without file download', async () => {
+      const opts = createTestOpts();
+      const channel = new NapCatChannel('ws://localhost:6700', '', opts, tmpDir);
+      await connectChannel(channel);
+
+      currentWs().emit('message', createGroupMessageEvent({}));
+
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'qq:123456',
+        expect.objectContaining({ content: 'Hello' }),
+      );
+    });
+  });
+
+  // --- sendFile ---
+
+  describe('sendFile', () => {
+    let tmpDir: string;
+
+    beforeEach(() => {
+      tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'napcat-sendfile-'));
+    });
+
+    afterEach(() => {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    });
+
+    it('sends a file as base64 to a group', async () => {
+      const opts = createTestOpts();
+      const channel = new NapCatChannel('ws://localhost:6700', '', opts, tmpDir);
+      await connectChannel(channel);
+
+      // Record group chat type
+      currentWs().emit('message', createGroupMessageEvent({}));
+
+      // Create a test file
+      const testFile = path.join(tmpDir, 'test.txt');
+      fs.writeFileSync(testFile, 'hello world');
+
+      await channel.sendFile('qq:123456', testFile, 'file');
+
+      const sendCalls = currentWs().send.mock.calls;
+      const apiCall = sendCalls.find((c: any[]) => {
+        try {
+          const parsed = JSON.parse(c[0]);
+          return parsed.action === 'send_group_msg' &&
+            parsed.params?.message?.[0]?.type === 'file';
+        } catch { return false; }
+      });
+      expect(apiCall).toBeDefined();
+
+      const sent = JSON.parse(apiCall![0]);
+      expect(sent.params.group_id).toBe(123456);
+      expect(sent.params.message[0].data.file).toMatch(/^base64:\/\//);
+      expect(sent.params.message[0].data.name).toBe('test.txt');
+    });
+
+    it('sends an image to a private chat', async () => {
+      const opts = createTestOpts({
+        registeredGroups: vi.fn(() => ({
+          'qq:99001': {
+            name: 'Alice DM',
+            folder: 'alice_dm',
+            trigger: '@Andy',
+            added_at: '2024-01-01T00:00:00.000Z',
+          },
+        })),
+      });
+      const channel = new NapCatChannel('ws://localhost:6700', '', opts, tmpDir);
+      await connectChannel(channel);
+
+      // Record private chat type
+      currentWs().emit('message', createPrivateMessageEvent({}));
+
+      const testFile = path.join(tmpDir, 'photo.jpg');
+      fs.writeFileSync(testFile, 'fake-jpeg-data');
+
+      await channel.sendFile('qq:99001', testFile, 'image');
+
+      const sendCalls = currentWs().send.mock.calls;
+      const apiCall = sendCalls.find((c: any[]) => {
+        try {
+          const parsed = JSON.parse(c[0]);
+          return parsed.action === 'send_private_msg' &&
+            parsed.params?.message?.[0]?.type === 'image';
+        } catch { return false; }
+      });
+      expect(apiCall).toBeDefined();
+
+      const sent = JSON.parse(apiCall![0]);
+      expect(sent.params.user_id).toBe(99001);
+      expect(sent.params.message[0].data.name).toBe('photo.jpg');
+    });
+
+    it('rejects files larger than 30MB', async () => {
+      const opts = createTestOpts();
+      const channel = new NapCatChannel('ws://localhost:6700', '', opts, tmpDir);
+      await connectChannel(channel);
+
+      // Create a file larger than 30MB using a sparse file
+      const testFile = path.join(tmpDir, 'huge.bin');
+      const fd = fs.openSync(testFile, 'w');
+      // Write 1 byte at position 31MB to create a sparse file that reports > 30MB
+      fs.writeSync(fd, Buffer.from([0]), 0, 1, 31 * 1024 * 1024);
+      fs.closeSync(fd);
+
+      await channel.sendFile('qq:123456', testFile, 'file');
+
+      // Should not have sent any message (only the auto-response mock calls exist)
+      const sendCalls = currentWs().send.mock.calls;
+      const apiCall = sendCalls.find((c: any[]) => {
+        try {
+          const parsed = JSON.parse(c[0]);
+          return parsed.action === 'send_group_msg' &&
+            parsed.params?.message?.[0]?.type === 'file';
+        } catch { return false; }
+      });
+      expect(apiCall).toBeUndefined();
+    });
+
+    it('handles non-existent file gracefully', async () => {
+      const opts = createTestOpts();
+      const channel = new NapCatChannel('ws://localhost:6700', '', opts, tmpDir);
+      await connectChannel(channel);
+
+      // Should not throw
+      await channel.sendFile('qq:123456', '/nonexistent/file.txt', 'file');
     });
   });
 });

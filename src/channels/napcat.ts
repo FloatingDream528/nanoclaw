@@ -73,6 +73,43 @@ export interface NapCatChannelOpts {
 }
 
 /**
+ * Format a single OneBot 11 message segment into a text representation.
+ * Shared by extractTextContent and extractContentWithFiles.
+ */
+export function formatSegment(seg: OneBotSegment): string | null {
+  switch (seg.type) {
+    case 'text':
+      return seg.data.text || '';
+    case 'at':
+      return seg.data.qq === 'all' ? '@all' : `@${seg.data.qq}`;
+    case 'face':
+      return '[QQ Face]';
+    case 'image':
+      return '[Image]';
+    case 'record':
+      return '[Voice]';
+    case 'video':
+      return '[Video]';
+    case 'file':
+      return `[File: ${seg.data.name || seg.data.file || ''}]`;
+    case 'share':
+      return `[Link: ${seg.data.title || seg.data.url || ''}]`;
+    case 'location':
+      return `[Location: ${seg.data.title || ''}]`;
+    case 'reply':
+      return null; // Reply reference — skip, the actual content follows
+    case 'forward':
+      return '[Forward message]';
+    case 'json':
+      return '[JSON message]';
+    case 'xml':
+      return '[XML message]';
+    default:
+      return seg.data?.text || null;
+  }
+}
+
+/**
  * Extract plain text content from OneBot 11 message segments.
  * Handles both array format and raw string format.
  */
@@ -90,57 +127,9 @@ export function extractTextContent(
 
   const parts: string[] = [];
   for (const seg of message) {
-    switch (seg.type) {
-      case 'text':
-        parts.push(seg.data.text || '');
-        break;
-      case 'at':
-        // @mention — qq can be a number or "all"
-        if (seg.data.qq === 'all') {
-          parts.push('@all');
-        } else {
-          parts.push(`@${seg.data.qq}`);
-        }
-        break;
-      case 'face':
-        parts.push('[QQ Face]');
-        break;
-      case 'image':
-        parts.push('[Image]');
-        break;
-      case 'record':
-        parts.push('[Voice]');
-        break;
-      case 'video':
-        parts.push('[Video]');
-        break;
-      case 'file':
-        parts.push(`[File: ${seg.data.name || seg.data.file || ''}]`);
-        break;
-      case 'share':
-        parts.push(`[Link: ${seg.data.title || seg.data.url || ''}]`);
-        break;
-      case 'location':
-        parts.push(`[Location: ${seg.data.title || ''}]`);
-        break;
-      case 'reply':
-        // Reply reference — skip, the actual content follows
-        break;
-      case 'forward':
-        parts.push('[Forward message]');
-        break;
-      case 'json':
-        parts.push('[JSON message]');
-        break;
-      case 'xml':
-        parts.push('[XML message]');
-        break;
-      default:
-        // Unknown segment type — use raw text if available
-        if (seg.data?.text) {
-          parts.push(seg.data.text);
-        }
-        break;
+    const text = formatSegment(seg);
+    if (text !== null) {
+      parts.push(text);
     }
   }
 
@@ -184,6 +173,8 @@ export class NapCatChannel implements Channel {
   private selfId: number = 0;
   private connected = false;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private reconnectDelay = 5000;
+  private static readonly MAX_RECONNECT_DELAY = 300000; // 5 minutes
   private chatTypes = new Map<string, 'group' | 'private'>();
   private static readonly MAX_CHAT_TYPES = 10000;
   private pendingCalls = new Map<
@@ -229,6 +220,7 @@ export class NapCatChannel implements Channel {
         if (!this.connected && this.ws?.readyState === WebSocket.OPEN) {
           this.connected = true;
           clearTimeout(connectTimeout);
+          this.reconnectDelay = 5000; // Reset backoff on successful connect
           logger.info('NapCat connected (no lifecycle event received)');
           // Try to fetch selfId via API
           try {
@@ -278,6 +270,7 @@ export class NapCatChannel implements Channel {
                 this.connected = true;
                 clearTimeout(connectTimeout);
                 clearTimeout(fallbackTimer);
+                this.reconnectDelay = 5000; // Reset backoff on successful connect
                 logger.info(
                   { selfId: this.selfId },
                   'NapCat bot connected (lifecycle event)',
@@ -330,17 +323,24 @@ export class NapCatChannel implements Channel {
 
   private scheduleReconnect(): void {
     if (this.reconnectTimer) return;
+    const delay = this.reconnectDelay;
     this.reconnectTimer = setTimeout(async () => {
       this.reconnectTimer = null;
-      logger.info('NapCat attempting reconnection...');
+      logger.info({ delay }, 'NapCat attempting reconnection...');
       try {
         await this.connect();
         logger.info('NapCat reconnected successfully');
+        this.reconnectDelay = 5000; // Reset on success
       } catch (err) {
         logger.error({ err }, 'NapCat reconnection failed');
+        // Exponential backoff: double delay, cap at MAX_RECONNECT_DELAY
+        this.reconnectDelay = Math.min(
+          this.reconnectDelay * 2,
+          NapCatChannel.MAX_RECONNECT_DELAY,
+        );
         this.scheduleReconnect();
       }
-    }, 5000);
+    }, delay);
   }
 
   /**
@@ -532,58 +532,14 @@ export class NapCatChannel implements Channel {
           }
         }
         // Fallback to placeholder
-        switch (seg.type) {
-          case 'image':
-            parts.push('[Image]');
-            break;
-          case 'record':
-            parts.push('[Voice]');
-            break;
-          case 'video':
-            parts.push('[Video]');
-            break;
-          case 'file':
-            parts.push(`[File: ${seg.data.name || seg.data.file || ''}]`);
-            break;
+        const placeholder = formatSegment(seg);
+        if (placeholder !== null) {
+          parts.push(placeholder);
         }
       } else {
-        // Handle non-file segments identically to extractTextContent
-        switch (seg.type) {
-          case 'text':
-            parts.push(seg.data.text || '');
-            break;
-          case 'at':
-            if (seg.data.qq === 'all') {
-              parts.push('@all');
-            } else {
-              parts.push(`@${seg.data.qq}`);
-            }
-            break;
-          case 'face':
-            parts.push('[QQ Face]');
-            break;
-          case 'share':
-            parts.push(`[Link: ${seg.data.title || seg.data.url || ''}]`);
-            break;
-          case 'location':
-            parts.push(`[Location: ${seg.data.title || ''}]`);
-            break;
-          case 'reply':
-            break;
-          case 'forward':
-            parts.push('[Forward message]');
-            break;
-          case 'json':
-            parts.push('[JSON message]');
-            break;
-          case 'xml':
-            parts.push('[XML message]');
-            break;
-          default:
-            if (seg.data?.text) {
-              parts.push(seg.data.text);
-            }
-            break;
+        const text = formatSegment(seg);
+        if (text !== null) {
+          parts.push(text);
         }
       }
     }
@@ -619,6 +575,8 @@ export class NapCatChannel implements Channel {
       const firstKey = this.chatTypes.keys().next().value;
       if (firstKey !== undefined) this.chatTypes.delete(firstKey);
     }
+    // Delete-then-set to maintain LRU insertion order
+    this.chatTypes.delete(chatJid);
     this.chatTypes.set(chatJid, event.message_type);
 
     // Store chat metadata
@@ -707,25 +665,44 @@ export class NapCatChannel implements Channel {
   async sendMessage(jid: string, text: string): Promise<void> {
     try {
       const id = jid.replace(/^qq:/, '');
+      const numericId = parseInt(id, 10);
+      if (isNaN(numericId)) {
+        logger.warn({ jid }, 'NapCat: invalid JID (not a number)');
+        return;
+      }
 
       // Determine if this is a group or private message
       // Use recorded chat type from received messages; fall back to 'private'
       const chatType = this.chatTypes.get(jid) || 'private';
       const isGroup = chatType === 'group';
 
-      // Build message segments (plain text)
-      const message: OneBotSegment[] = [{ type: 'text', data: { text } }];
-
-      if (isGroup) {
-        await this.callApi('send_group_msg', {
-          group_id: parseInt(id, 10),
-          message,
-        });
+      // QQ has a ~4500 character limit per message — split if needed
+      const MAX_LENGTH = 4500;
+      const chunks: string[] = [];
+      if (text.length <= MAX_LENGTH) {
+        chunks.push(text);
       } else {
-        await this.callApi('send_private_msg', {
-          user_id: parseInt(id, 10),
-          message,
-        });
+        for (let i = 0; i < text.length; i += MAX_LENGTH) {
+          chunks.push(text.slice(i, i + MAX_LENGTH));
+        }
+      }
+
+      for (const chunk of chunks) {
+        const message: OneBotSegment[] = [
+          { type: 'text', data: { text: chunk } },
+        ];
+
+        if (isGroup) {
+          await this.callApi('send_group_msg', {
+            group_id: numericId,
+            message,
+          });
+        } else {
+          await this.callApi('send_private_msg', {
+            user_id: numericId,
+            message,
+          });
+        }
       }
 
       logger.info({ jid, length: text.length }, 'NapCat message sent');
@@ -736,7 +713,8 @@ export class NapCatChannel implements Channel {
 
   /**
    * Send a file (image, voice, video, or document) to a chat.
-   * Reads the file from disk, base64-encodes it, and sends via OneBot API.
+   * Uses file:// protocol for local paths to avoid base64 memory overhead.
+   * Falls back to base64 encoding if needed.
    */
   async sendFile(
     jid: string,
@@ -755,30 +733,34 @@ export class NapCatChannel implements Channel {
         return;
       }
 
-      const fileData = await fs.promises.readFile(filePath);
-      const base64 = fileData.toString('base64');
-      const filename = path.basename(filePath);
-
       const id = jid.replace(/^qq:/, '');
+      const numericId = parseInt(id, 10);
+      if (isNaN(numericId)) {
+        logger.warn({ jid }, 'NapCat: invalid JID (not a number)');
+        return;
+      }
+
       const chatType = this.chatTypes.get(jid) || 'private';
       const isGroup = chatType === 'group';
+      const filename = path.basename(filePath);
+      const absolutePath = path.resolve(filePath);
 
       const segment: OneBotSegment = {
         type,
         data: {
-          file: `base64://${base64}`,
+          file: `file://${absolutePath}`,
           name: filename,
         },
       };
 
       if (isGroup) {
         await this.callApi('send_group_msg', {
-          group_id: parseInt(id, 10),
+          group_id: numericId,
           message: [segment],
         });
       } else {
         await this.callApi('send_private_msg', {
-          user_id: parseInt(id, 10),
+          user_id: numericId,
           message: [segment],
         });
       }

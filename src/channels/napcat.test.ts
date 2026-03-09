@@ -94,6 +94,7 @@ import {
   NapCatChannel,
   NapCatChannelOpts,
   extractTextContent,
+  formatSegment,
   buildJid,
   isBotMentioned,
 } from './napcat.js';
@@ -338,6 +339,30 @@ describe('NapCatChannel', () => {
     it('handles file segments with no name', () => {
       const segments = [{ type: 'file', data: {} }];
       expect(extractTextContent(segments, '')).toBe('[File: ]');
+    });
+  });
+
+  describe('formatSegment', () => {
+    it('returns text content', () => {
+      expect(formatSegment({ type: 'text', data: { text: 'hello' } })).toBe(
+        'hello',
+      );
+    });
+
+    it('returns null for reply segments', () => {
+      expect(formatSegment({ type: 'reply', data: { id: '1' } })).toBeNull();
+    });
+
+    it('returns null for unknown segments without text', () => {
+      expect(
+        formatSegment({ type: 'unknown', data: { foo: 'bar' } }),
+      ).toBeNull();
+    });
+
+    it('returns text for unknown segments with text data', () => {
+      expect(
+        formatSegment({ type: 'unknown', data: { text: 'fallback' } }),
+      ).toBe('fallback');
     });
   });
 
@@ -791,6 +816,56 @@ describe('NapCatChannel', () => {
       await channel.sendMessage('qq:123456', 'No connection');
 
       // No error, no send call
+    });
+
+    it('splits long messages into chunks', async () => {
+      const opts = createTestOpts();
+      const channel = new NapCatChannel('ws://localhost:6700', '', opts);
+      await connectChannel(channel);
+
+      // Receive a group message to record chat type
+      currentWs().emit('message', createGroupMessageEvent({}));
+
+      // Create a message longer than 4500 chars
+      const longText = 'A'.repeat(9500);
+      await channel.sendMessage('qq:123456', longText);
+
+      const sendCalls = currentWs().send.mock.calls;
+      const groupMsgCalls = sendCalls.filter((c: any[]) => {
+        try {
+          const parsed = JSON.parse(c[0]);
+          return (
+            parsed.action === 'send_group_msg' &&
+            parsed.params?.message?.[0]?.type === 'text'
+          );
+        } catch {
+          return false;
+        }
+      });
+      // 9500 chars / 4500 = 3 chunks
+      expect(groupMsgCalls.length).toBe(3);
+      const first = JSON.parse(groupMsgCalls[0][0]);
+      expect(first.params.message[0].data.text.length).toBe(4500);
+    });
+
+    it('warns and returns for invalid JID', async () => {
+      const opts = createTestOpts();
+      const channel = new NapCatChannel('ws://localhost:6700', '', opts);
+      await connectChannel(channel);
+
+      // Should not throw, should not send
+      await channel.sendMessage('qq:abc', 'Invalid');
+
+      const sendCalls = currentWs().send.mock.calls;
+      const apiCall = sendCalls.find((c: any[]) => {
+        try {
+          const parsed = JSON.parse(c[0]);
+          return parsed.action === 'send_private_msg';
+        } catch {
+          return false;
+        }
+      });
+      expect(apiCall).toBeUndefined();
     });
   });
 
@@ -1251,7 +1326,7 @@ describe('NapCatChannel', () => {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     });
 
-    it('sends a file as base64 to a group', async () => {
+    it('sends a file via file:// protocol to a group', async () => {
       const opts = createTestOpts();
       const channel = new NapCatChannel(
         'ws://localhost:6700',
@@ -1286,7 +1361,7 @@ describe('NapCatChannel', () => {
 
       const sent = JSON.parse(apiCall![0]);
       expect(sent.params.group_id).toBe(123456);
-      expect(sent.params.message[0].data.file).toMatch(/^base64:\/\//);
+      expect(sent.params.message[0].data.file).toMatch(/^file:\/\//);
       expect(sent.params.message[0].data.name).toBe('test.txt');
     });
 
